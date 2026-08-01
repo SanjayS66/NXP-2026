@@ -19,30 +19,23 @@ from std_msgs.msg import String
 import cv2
 import numpy as np
 import os
-import time
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 try:
     from ultralytics import YOLO
+    HAS_ULTRALYTICS = True
 except ImportError:
-    YOLO = None
-
-# Confidence threshold for sign detection
-SIGN_CONFIDENCE_THRESHOLD = 0.5
-
-# Cooldown between publishing the same sign (seconds)
-SIGN_COOLDOWN = 1.0
-
-# Direction mapping from model class names
-# The YOLO model detects sign boards. Each sign has a letter (A/B/C/X/Y/Z)
-# and a direction (Left/Straight/Right).
-# The label format from the model is expected to be like "A_left", "X_straight", etc.
-# We map these to the format the runner node expects.
+    HAS_ULTRALYTICS = False
 
 class ObjectRecognizer(Node):
     """
-    ROS 2 Node that processes raw camera images to recognize traffic sign boards
-    using a YOLOv8 model. It publishes the detected sign type/labels on the
-    `/sign_board_detection` topic.
+    ROS 2 Node that processes raw camera images to recognize traffic sign boards.
+    It publishes the detected sign type/labels on the `/sign_board_detection` topic.
     """
     def __init__(self):
         super().__init__('object_recognizer')
@@ -60,83 +53,164 @@ class ObjectRecognizer(Node):
             '/sign_board_detection',
             10)
 
-        # Load YOLOv8 model
         self.model = None
-        if YOLO is not None:
+        self.model_type = None
+        self.frame_counter = 0
+
+        # Attempt to load the pre-trained PyTorch/YOLO model (best.pt)
+        if HAS_TORCH:
             try:
                 dir_path = os.path.dirname(os.path.abspath(__file__))
                 model_path = os.path.join(dir_path, 'best.pt')
+                
                 if os.path.exists(model_path):
-                    self.model = YOLO(model_path)
-                    # Log the class names the model was trained on
-                    self.class_names = self.model.names
-                    self.get_logger().info(f"Loaded YOLO model from {model_path}")
-                    self.get_logger().info(f"Model classes: {self.class_names}")
+                    if HAS_ULTRALYTICS:
+                        self.get_logger().info(f"Loading YOLOv8 model from {model_path}")
+                        self.model = YOLO(model_path)
+                        self.model_type = 'yolov8'
+                    else:
+                        self.get_logger().info(f"Loading YOLOv5 model via torch.hub from {model_path}")
+                        self.model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path, force_reload=True, _verbose=False)
+                        self.model_type = 'yolov5'
                 else:
                     self.get_logger().warn(f"Model file not found at {model_path}")
             except Exception as e:
-                self.get_logger().error(f"Failed to load YOLO model: {e}")
+                self.get_logger().error(f"Failed to load PyTorch model: {e}")
         else:
-            self.get_logger().warn("ultralytics is not installed. Running in placeholder mode.")
-
-        # Cooldown tracking
-        self.last_published_sign = None
-        self.last_publish_time = 0.0
+            self.get_logger().warn("PyTorch is not installed. Running in CV/Placeholder mode.")
 
         self.get_logger().info("Object Recognizer Node started. Waiting for images...")
 
     def camera_image_callback(self, message):
         """Processes incoming camera frames to classify traffic signs."""
+        self.frame_counter += 1
+        # Rate limit: Process every 5th frame (~6 Hz)
+        if self.frame_counter % 5 != 0:
+            return
+
+        # Convert compressed image message to OpenCV format
         np_arr = np.frombuffer(message.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         sign_detected = self.classify_sign(image)
 
-        if sign_detected is not None:
-            # Apply cooldown — don't publish the same sign repeatedly
-            now = time.time()
-            if (sign_detected != self.last_published_sign or
-                    (now - self.last_publish_time) > SIGN_COOLDOWN):
-                msg = String()
-                msg.data = sign_detected
-                self.publisher_sign.publish(msg)
-                self.last_published_sign = sign_detected
-                self.last_publish_time = now
-                self.get_logger().info(f"Detected Sign Board: {sign_detected}")
+        if sign_detected:
+            msg = String()
+            msg.data = sign_detected
+            self.publisher_sign.publish(msg)
+            self.get_logger().info(f"Detected Sign Board: {sign_detected}")
 
     def classify_sign(self, image):
         """
-        Detect and classify traffic sign boards using YOLOv8.
+        Classify traffic sign boards using YOLO model.
 
-        Returns a string like "A_left", "X_straight", "B_right" or None.
+        The model detects letters (A,B,C,X,Y,Z) and direction arrows
+        (Left,Right,Straight) as SEPARATE bounding boxes. This function
+        pairs each letter with its spatially nearest direction arrow to
+        produce paired "CODE:DIRECTION" tokens (e.g. "A:LEFT,X:RIGHT").
+
+        Returns a comma-separated string of paired detections, or None.
         """
         if self.model is None:
             return None
 
+        # ── Class-set constants ───────────────────────────────────────────
+        LETTER_CLASSES    = {'A','B','C','X','Y','Z'}
+        DIRECTION_CLASSES = {'LEFT','RIGHT','STRAIGHT'}
+        # Max pixel distance between a letter-center and arrow-center to
+        # count as the same sign board. Prevents cross-sign pairings.
+        MAX_PAIRING_DIST  = 200  # pixels
+
+        letters    = []   # [(letter_str, cx, cy)]
+        directions = []   # [(direction_str, cx, cy)]
+
         try:
-            results = self.model.predict(
-                image,
-                conf=SIGN_CONFIDENCE_THRESHOLD,
-                verbose=False
-            )
+            if self.model_type == 'yolov8':
+                results = self.model(image, verbose=False)
+                for r in results:
+                    for box in r.boxes:
+                        conf = float(box.conf[0])
+                        if conf < 0.5:
+                            continue
+                        cls_id     = int(box.cls[0])
+                        class_name = self.model.names[cls_id]
+                        xyxy       = box.xyxy[0].cpu().numpy()
+                        cx = float((xyxy[0] + xyxy[2]) / 2)
+                        cy = float((xyxy[1] + xyxy[3]) / 2)
+                        name_up = class_name.strip().upper()
+                        if name_up in LETTER_CLASSES:
+                            letters.append((name_up, cx, cy))
+                        elif name_up in DIRECTION_CLASSES:
+                            directions.append((name_up, cx, cy))
+                        elif '_' in class_name or ':' in class_name:
+                            # Pre-paired class name from model (e.g. "A_LEFT" or "A:LEFT")
+                            letters.append((class_name.replace('_', ':').upper(), cx, cy))
 
-            if len(results) == 0 or len(results[0].boxes) == 0:
-                return None
-
-            # Get the detection with highest confidence
-            boxes = results[0].boxes
-            best_idx = int(boxes.conf.argmax())
-            class_id = int(boxes.cls[best_idx])
-            confidence = float(boxes.conf[best_idx])
-
-            # Get class name from model
-            sign_label = self.class_names.get(class_id, f"class_{class_id}")
-
-            return sign_label
+            elif self.model_type == 'yolov5':
+                results = self.model(image)
+                preds   = results.xyxy[0].cpu().numpy()
+                for pred in preds:
+                    xmin, ymin, xmax, ymax, conf, cls_id = pred
+                    if conf < 0.5:
+                        continue
+                    class_name = self.model.names[int(cls_id)]
+                    cx = float((xmin + xmax) / 2)
+                    cy = float((ymin + ymax) / 2)
+                    name_up = class_name.strip().upper()
+                    if name_up in LETTER_CLASSES:
+                        letters.append((name_up, cx, cy))
+                    elif name_up in DIRECTION_CLASSES:
+                        directions.append((name_up, cx, cy))
+                    elif '_' in class_name or ':' in class_name:
+                        letters.append((class_name.replace('_', ':').upper(), cx, cy))
 
         except Exception as e:
-            self.get_logger().debug(f"YOLO inference failed: {e}")
+            self.get_logger().debug(f"Inference failed: {e}")
             return None
+
+        # ── Spatial pairing: match each letter to its nearest arrow ───────
+        # The YOLO model emits separate bboxes for the letter label and the
+        # direction arrow on a sign board. We pair each letter with the
+        # closest arrow whose centre is within MAX_PAIRING_DIST pixels.
+        paired    = []
+        used_dirs = set()
+
+        for (letter, lx, ly) in letters:
+            if ':' in letter:          # already paired ("A:LEFT" style class)
+                paired.append(letter)
+                continue
+
+            best_dist = float('inf')
+            best_dir  = None
+            best_idx  = -1
+            for i, (dir_name, dx, dy) in enumerate(directions):
+                if i in used_dirs:
+                    continue
+                dist = ((lx - dx) ** 2 + (ly - dy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_dir  = dir_name
+                    best_idx  = i
+
+            if best_dir is not None and best_dist <= MAX_PAIRING_DIST:
+                paired.append(f"{letter}:{best_dir}")
+                used_dirs.add(best_idx)
+                self.get_logger().info(
+                    f"[SIGN_PAIR] {letter}:{best_dir} (dist={best_dist:.0f}px)")
+            else:
+                self.get_logger().debug(
+                    f"[SIGN_PAIR] '{letter}' no nearby arrow "
+                    f"(best={best_dist:.0f}px > {MAX_PAIRING_DIST}px thr)")
+
+        if not paired:
+            return None
+
+        # Deduplicate then publish
+        unique = list(dict.fromkeys(paired))
+        result = ",".join(unique)
+        self.get_logger().info(f"[SIGN_DETECT] Publishing: '{result}'")
+        return result
+
 
 def main(args=None):
     rclpy.init(args=args)
