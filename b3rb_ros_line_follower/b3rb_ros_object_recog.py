@@ -98,119 +98,90 @@ class ObjectRecognizer(Node):
             msg = String()
             msg.data = sign_detected
             self.publisher_sign.publish(msg)
-            self.get_logger().info(f"Detected Sign Board: {sign_detected}")
+            
+            # Only log if it's a new detection to reduce spam
+            if getattr(self, 'last_published_sign', None) != sign_detected:
+                self.get_logger().info(f"Detected Sign Board: {sign_detected}")
+                self.last_published_sign = sign_detected
 
     def classify_sign(self, image):
         """
         Classify traffic sign boards using YOLO model.
-
-        The model detects letters (A,B,C,X,Y,Z) and direction arrows
-        (Left,Right,Straight) as SEPARATE bounding boxes. This function
-        pairs each letter with its spatially nearest direction arrow to
-        produce paired "CODE:DIRECTION" tokens (e.g. "A:LEFT,X:RIGHT").
-
-        Returns a comma-separated string of paired detections, or None.
+        Returns a comma-separated string of detections e.g., "A:LEFT,X:RIGHT"
         """
         if self.model is None:
             return None
 
-        # ── Class-set constants ───────────────────────────────────────────
-        LETTER_CLASSES    = {'A','B','C','X','Y','Z'}
-        DIRECTION_CLASSES = {'LEFT','RIGHT','STRAIGHT'}
-        # Max pixel distance between a letter-center and arrow-center to
-        # count as the same sign board. Prevents cross-sign pairings.
-        MAX_PAIRING_DIST  = 200  # pixels
-
-        letters    = []   # [(letter_str, cx, cy)]
-        directions = []   # [(direction_str, cx, cy)]
-
+        letters = []
+        arrows = []
+        
         try:
             if self.model_type == 'yolov8':
                 results = self.model(image, verbose=False)
                 for r in results:
-                    for box in r.boxes:
+                    boxes = r.boxes
+                    for box in boxes:
                         conf = float(box.conf[0])
-                        if conf < 0.5:
-                            continue
-                        cls_id     = int(box.cls[0])
-                        class_name = self.model.names[cls_id]
-                        xyxy       = box.xyxy[0].cpu().numpy()
-                        cx = float((xyxy[0] + xyxy[2]) / 2)
-                        cy = float((xyxy[1] + xyxy[3]) / 2)
-                        name_up = class_name.strip().upper()
-                        if name_up in LETTER_CLASSES:
-                            letters.append((name_up, cx, cy))
-                        elif name_up in DIRECTION_CLASSES:
-                            directions.append((name_up, cx, cy))
-                        elif '_' in class_name or ':' in class_name:
-                            # Pre-paired class name from model (e.g. "A_LEFT" or "A:LEFT")
-                            letters.append((class_name.replace('_', ':').upper(), cx, cy))
-
+                        if conf > 0.5:
+                            cls_id = int(box.cls[0])
+                            class_name = self.model.names[cls_id]
+                            
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            cx = (x1 + x2) / 2.0
+                            cy = (y1 + y2) / 2.0
+                            
+                            if class_name in ['A', 'B', 'C', 'X', 'Y', 'Z']:
+                                letters.append({'name': class_name, 'cx': cx, 'cy': cy})
+                            elif class_name in ['Left', 'Right', 'Straight']:
+                                arrows.append({'name': class_name, 'cx': cx, 'cy': cy})
+                                
             elif self.model_type == 'yolov5':
                 results = self.model(image)
-                preds   = results.xyxy[0].cpu().numpy()
+                preds = results.xyxy[0].cpu().numpy()
                 for pred in preds:
                     xmin, ymin, xmax, ymax, conf, cls_id = pred
-                    if conf < 0.5:
-                        continue
-                    class_name = self.model.names[int(cls_id)]
-                    cx = float((xmin + xmax) / 2)
-                    cy = float((ymin + ymax) / 2)
-                    name_up = class_name.strip().upper()
-                    if name_up in LETTER_CLASSES:
-                        letters.append((name_up, cx, cy))
-                    elif name_up in DIRECTION_CLASSES:
-                        directions.append((name_up, cx, cy))
-                    elif '_' in class_name or ':' in class_name:
-                        letters.append((class_name.replace('_', ':').upper(), cx, cy))
-
+                    if conf > 0.7:
+                        class_name = self.model.names[int(cls_id)]
+                        
+                        cx = (xmin + xmax) / 2.0
+                        cy = (ymin + ymax) / 2.0
+                        
+                        if class_name in ['A', 'B', 'C', 'X', 'Y', 'Z']:
+                            letters.append({'name': class_name, 'cx': cx, 'cy': cy})
+                        elif class_name in ['Left', 'Right', 'Straight']:
+                            arrows.append({'name': class_name, 'cx': cx, 'cy': cy})
+                            
+            if len(letters) > 0 and len(arrows) > 0:
+                formatted_signs = []
+                for letter in letters:
+                    best_arrow = None
+                    min_dist = float('inf')
+                    
+                    for arrow in arrows:
+                        # Find the arrow with the closest horizontal center
+                        dist = abs(letter['cx'] - arrow['cx'])
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_arrow = arrow
+                            
+                    if best_arrow is not None:
+                        # Convert arrow class to uppercase (e.g. 'Left' -> 'LEFT')
+                        direction = best_arrow['name'].upper()
+                        formatted_signs.append(f"{letter['name']}:{direction}")
+                        
+                # Remove duplicates in a single frame
+                unique_signs = list(set(formatted_signs))
+                # Sort to ensure consistent order (prevents spam from order changes)
+                unique_signs.sort()
+                
+                # Only consider the detection valid if all 6 signs are visible
+                if len(unique_signs) == 6:
+                    return ",".join(unique_signs)
+                
         except Exception as e:
             self.get_logger().debug(f"Inference failed: {e}")
-            return None
 
-        # ── Spatial pairing: match each letter to its nearest arrow ───────
-        # The YOLO model emits separate bboxes for the letter label and the
-        # direction arrow on a sign board. We pair each letter with the
-        # closest arrow whose centre is within MAX_PAIRING_DIST pixels.
-        paired    = []
-        used_dirs = set()
-
-        for (letter, lx, ly) in letters:
-            if ':' in letter:          # already paired ("A:LEFT" style class)
-                paired.append(letter)
-                continue
-
-            best_dist = float('inf')
-            best_dir  = None
-            best_idx  = -1
-            for i, (dir_name, dx, dy) in enumerate(directions):
-                if i in used_dirs:
-                    continue
-                dist = ((lx - dx) ** 2 + (ly - dy) ** 2) ** 0.5
-                if dist < best_dist:
-                    best_dist = dist
-                    best_dir  = dir_name
-                    best_idx  = i
-
-            if best_dir is not None and best_dist <= MAX_PAIRING_DIST:
-                paired.append(f"{letter}:{best_dir}")
-                used_dirs.add(best_idx)
-                self.get_logger().info(
-                    f"[SIGN_PAIR] {letter}:{best_dir} (dist={best_dist:.0f}px)")
-            else:
-                self.get_logger().debug(
-                    f"[SIGN_PAIR] '{letter}' no nearby arrow "
-                    f"(best={best_dist:.0f}px > {MAX_PAIRING_DIST}px thr)")
-
-        if not paired:
-            return None
-
-        # Deduplicate then publish
-        unique = list(dict.fromkeys(paired))
-        result = ",".join(unique)
-        self.get_logger().info(f"[SIGN_DETECT] Publishing: '{result}'")
-        return result
-
+        return None
 
 def main(args=None):
     rclpy.init(args=args)

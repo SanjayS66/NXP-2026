@@ -33,15 +33,6 @@ class QRDetector(Node):
     """
     ROS 2 Node that processes raw camera images to scan for QR codes.
     It publishes the detected QR code payload and distance proxy on the `/qr_detection` topic.
-
-    Cooldown Strategy (FIXED):
-    - Old approach: a single 5-second global timer blocked ALL QR reads after any publish.
-      This caused the hospital QR to be silently ignored when the buggy arrived at a hospital
-      within 5 seconds of leaving a patient building.
-    - New approach: cooldown is PAYLOAD-AWARE. After publishing a QR code, only that exact
-      same payload is suppressed from being re-published. A completely different QR payload
-      (e.g. HOSPITAL_2 after PATIENT_1) bypasses the cooldown entirely and goes straight
-      through the 3-frame debounce — no time-gate blocking it.
     """
     def __init__(self):
         super().__init__('qr_detector')
@@ -68,27 +59,13 @@ class QRDetector(Node):
             '/qr_detection',
             10)
 
-        # ── Debounce State ──
-        # Tracks the current candidate payload being confirmed via consecutive frames.
+        # ── Debounce and Cooldown State ──
         self.last_qr_payload = None
         self.qr_consecutive_count = 0
-        self.QR_CONFIRM_THRESHOLD = 3   # Number of hits (with possible gaps) needed to confirm
-
-        # ── Miss-Buffer: tolerate brief decode failures without resetting ──
-        # pyzbar intermittently fails to decode even when the QR is in clear view
-        # (motion blur, angle, lighting). Resetting on every single missed frame
-        # makes the debounce yo-yo and prevents confirmation while moving.
-        # We allow up to QR_MISS_TOLERANCE consecutive decode failures before
-        # treating visibility as truly lost.
-        self.qr_miss_count = 0
-        self.QR_MISS_TOLERANCE = 3      # Consecutive misses before resetting count
-
-        # ── Payload-Aware Cooldown State ──
-        # After publishing a payload, that exact same payload is suppressed for
-        # SAME_PAYLOAD_COOLDOWN_SECS. A DIFFERENT payload bypasses this entirely.
-        self.last_published_payload = None   # The most recently published QR payload
-        self.same_payload_cooldown_until = 0.0  # Time until same-payload re-publish is allowed
-        self.SAME_PAYLOAD_COOLDOWN_SECS = 8.0   # How long to block re-reading the identical QR
+        self.qr_cooldown_until = 0.0
+        self.QR_CONFIRM_THRESHOLD = 3
+        self.QR_COOLDOWN_SECS = 5.0
+        self.frame_counter = 0
 
         if pyzbar is None:
             self.get_logger().warn("Pyzbar is NOT installed or failed to import! Falling back to OpenCV QRCodeDetector.")
@@ -99,8 +76,10 @@ class QRDetector(Node):
 
     def camera_image_callback(self, message):
         """Processes incoming camera frames to detect QR codes."""
-        # 1. Heartbeat check: Confirms callback is actually executing (prints every 2 seconds)
-        self.get_logger().info("Callback triggered: Received image frame.", throttle_duration_sec=2.0)
+        self.frame_counter += 1
+        # Rate limit: Process every 4th frame (~7.5 Hz)
+        if self.frame_counter % 4 != 0:
+            return
 
         try:
             image = self.bridge.imgmsg_to_cv2(message, "bgr8")
@@ -118,57 +97,38 @@ class QRDetector(Node):
         if result is not None:
             raw_payload, bbox_area = result
             clean_payload = self.clean_qr_payload(raw_payload)
-
-            self.get_logger().info(f"QR Detected! Raw: '{raw_payload}' | Clean: '{clean_payload}' | BBox Area: {bbox_area}px")
+            
+            # Log only occasionally to avoid spam
+            self.get_logger().debug(f"QR Detected! Raw: '{raw_payload}' | Clean: '{clean_payload}' | BBox Area: {bbox_area}px", throttle_duration_sec=2.0)
 
             # ── Debounce Logic ──
-            # On a hit: reset miss counter, increment hit counter.
-            # On a hit for a different payload: reset everything and start fresh.
-            self.qr_miss_count = 0   # Clear any pending misses — we have a valid frame
-
             if clean_payload == self.last_qr_payload:
                 self.qr_consecutive_count += 1
             else:
-                self.get_logger().info(
-                    f"New candidate payload detected: '{clean_payload}'. "
-                    f"Resetting debounce count.")
+                self.get_logger().info(f"New candidate payload detected: '{clean_payload}'. Resetting count.")
                 self.last_qr_payload = clean_payload
                 self.qr_consecutive_count = 1
-
-            self.get_logger().info(
-                f"Debounce progress: {self.qr_consecutive_count}/{self.QR_CONFIRM_THRESHOLD}")
+                
+            self.get_logger().debug(f"Debounce progress: {self.qr_consecutive_count}/{self.QR_CONFIRM_THRESHOLD}")
 
             if self.qr_consecutive_count >= self.QR_CONFIRM_THRESHOLD:
-                # ── Payload-Aware Cooldown Gate ──
-                # CASE 1: Different from last published → publish immediately.
-                # CASE 2: Same as last published → apply cooldown (avoid spamming server).
-                is_same_as_last_published = (clean_payload == self.last_published_payload)
-                still_on_cooldown = (current_time < self.same_payload_cooldown_until)
+                # Publish continuously so the runner can track when it disappears
+                msg = String()
+                msg.data = f"{clean_payload}|bbox={bbox_area}"
+                self.publisher_qr.publish(msg)
 
-                if is_same_as_last_published and still_on_cooldown:
-                    remaining = round(self.same_payload_cooldown_until - current_time, 1)
-                    self.get_logger().info(
-                        f"QR '{clean_payload}' confirmed but same-payload cooldown active "
-                        f"for {remaining}s more. Skipping publish."
-                    )
-                else:
-                    msg = String()
-                    msg.data = f"{clean_payload}|bbox={bbox_area}"
-                    self.publisher_qr.publish(msg)
+                if current_time > self.qr_cooldown_until:
                     self.get_logger().info(f"PUBLISHING CONFIRMED QR: {msg.data}")
-                    self.last_published_payload = clean_payload
-                    self.same_payload_cooldown_until = current_time + self.SAME_PAYLOAD_COOLDOWN_SECS
-                    self.qr_consecutive_count = 0  # Reset after publish
+                    # Activate log cooldown
+                    self.qr_cooldown_until = current_time + self.QR_COOLDOWN_SECS
+                else:
+                    remaining = round(self.qr_cooldown_until - current_time, 1)
+                    self.get_logger().debug(f"QR in view (logging cooldown: {remaining}s).", throttle_duration_sec=2.0)
         else:
-            # ── Miss handling: count consecutive misses, only reset after tolerance ──
-            self.qr_miss_count += 1
-            if self.qr_miss_count >= self.QR_MISS_TOLERANCE:
-                if self.qr_consecutive_count > 0:
-                    self.get_logger().warn(
-                        f"QR visibility lost ({self.qr_miss_count} consecutive misses). "
-                        f"Resetting debounce count (was {self.qr_consecutive_count}).")
-                self.qr_consecutive_count = 0
-                self.qr_miss_count = 0
+            if self.qr_consecutive_count > 0:
+                # self.get_logger().warn(f"Lost QR code visibility. Resetting consecutive count (was {self.qr_consecutive_count}).")
+                self.get_logger().debug(f"Lost QR code visibility. Resetting consecutive count (was {self.qr_consecutive_count}).")
+            self.qr_consecutive_count = 0
 
     def clean_qr_payload(self, raw_data):
         """Extracts the identifier from strings like '{LOC: PATIENT_1}'."""

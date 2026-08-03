@@ -94,6 +94,7 @@ class EdgeVectorsPublisher(Node):
         # EMA smoothing state: previous smoothed vector endpoints
         self.smoothed_v1 = None  # [[x0,y0], [x1,y1]]
         self.smoothed_v2 = None  # [[x0,y0], [x1,y1]]
+        self.frame_counter = 0
 
         print("Edge Vectors Publisher initialized")
     def publish_debug_image(self, publisher, image):
@@ -288,6 +289,11 @@ class EdgeVectorsPublisher(Node):
 
     def camera_image_callback(self, message):
         """Processes incoming camera frames and publishes detected EdgeVectors."""
+        self.frame_counter += 1
+        # Rate limit: Process every 2nd frame (~15 Hz)
+        if self.frame_counter % 2 != 0:
+            return
+
         try:
             image = self.bridge.imgmsg_to_cv2(message, "bgr8")
         except Exception as e:
