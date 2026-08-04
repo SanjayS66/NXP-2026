@@ -217,10 +217,41 @@ class LidarParkingDetector(Node):
                 self.set_state("TURNING")
 
         elif self.state == "TURNING":
-            # Very slow speed and max steering to achieve the tightest possible turning radius.
-            # Same magnitudes as before, just signed by self.turn_dir.
-            self.target_speed = 0.25
+            # Steering is unchanged: max steer, same direction logic as
+            # before, for the tightest possible turning radius.
             self.target_turn = 1.5 * self.turn_dir
+
+            # Scale forward speed by how close we already are to the
+            # cones we're turning toward, so we ease off / rotate in
+            # place instead of driving straight into them. This only
+            # changes the speed we send - it does NOT touch the state
+            # transition below, which still fires on the exact same
+            # time + distance conditions as before.
+            #
+            # Calibrated from measured geometry: spot width (gap between
+            # adjacent cone lines) = 0.605m, bot width = 0.227m. Best
+            # case (perfectly centered) clearance to either side is only
+            # (0.605 - 0.227) / 2 = 0.189m - so any threshold above that
+            # can never be satisfied and stalls the bot before it can
+            # thread between the cones at all.
+            clearance = self.front_dist
+            if self.turn_dir < 0:
+                clearance = min(clearance, self.right_side_dist)
+            else:
+                clearance = min(clearance, self.left_side_dist)
+
+            BOT_HALF_WIDTH = 0.227 / 2.0   # 0.1135m
+            STOP_CLEARANCE = BOT_HALF_WIDTH + 0.02   # ~0.13m: side of the bot is about to touch a cone
+            SAFE_CLEARANCE = 0.28                    # below the 0.605m spot width, above the 0.189m centered clearance
+
+            if clearance <= STOP_CLEARANCE:
+                speed_scale = 0.0
+            elif clearance >= SAFE_CLEARANCE:
+                speed_scale = 1.0
+            else:
+                speed_scale = (clearance - STOP_CLEARANCE) / (SAFE_CLEARANCE - STOP_CLEARANCE)
+
+            self.target_speed = 0.25 * speed_scale
             
             # Give the buggy enough time to physically complete the 90-degree sweep 
             if (now - self.state_time) > 3.5:
@@ -235,11 +266,48 @@ class LidarParkingDetector(Node):
             # More aggressive correction to keep it centered
             self.target_turn = max(-1.0, min(1.0, error * 2.0))
             
-            # Stop if there are obstacles on three sides: left, right, and front.
-            if self.left_side_dist < 1.2 and self.right_side_dist < 1.2 and self.front_dist < 1.5:
-                self.get_logger().info("Obstacles detected on 3 sides! Fully parked.")
+            # Stop condition, rebuilt around what's actually reliable
+            # for this geometry:
+            #
+            # This lot is an open pad with cones mostly on the outer
+            # perimeter/corners, not a continuous fence running the full
+            # depth on both sides - so requiring left AND right to be
+            # simultaneously tight (the old condition) rarely fires, and
+            # the bot just timed out after 8s of blind creeping, driving
+            # straight through the ~0.72-0.74m bay depth and out the far
+            # side (confirmed by the log: it hit the 8.0s fallback, not
+            # the obstacle check).
+            #
+            # New primary trigger: front_dist closing in on the far cone
+            # line - a direct, reliable "about to hit something ahead"
+            # signal, tightened from the old unreachable-in-time 1.5m
+            # down to a real near-collision distance.
+            #
+            # Backup trigger: dead-reckoned distance traveled since
+            # entering CENTERING, capped below the known real bay depth
+            # (0.72-0.74m, confirmed from two independent measurements
+            # earlier) so it physically cannot creep past the far cones
+            # even if the LIDAR never reports them (e.g. they're too
+            # thin/short to register in the front slice).
+            #
+            # Sides are kept as a bonus early-stop (good, snug fit) but
+            # are no longer required.
+            FRONT_STOP = 0.30
+            SIDE_STOP = 0.25
+            MAX_CENTERING_TRAVEL = 0.55  # meters, safety margin below the ~0.72m measured bay depth
+
+            traveled = self.target_speed * (now - self.state_time)
+
+            if self.front_dist < FRONT_STOP:
+                self.get_logger().info("Front clearance reached! Fully parked.")
                 self.set_state("STOPPED")
-            # Fallback timeout
+            elif self.left_side_dist < SIDE_STOP and self.right_side_dist < SIDE_STOP:
+                self.get_logger().info("Snug on both sides! Fully parked.")
+                self.set_state("STOPPED")
+            elif traveled >= MAX_CENTERING_TRAVEL:
+                self.get_logger().info("Reached max travel depth for this bay. Stopping.")
+                self.set_state("STOPPED")
+            # Fallback timeout (should now rarely be needed)
             elif (now - self.state_time) > 8.0:
                 self.set_state("STOPPED")
                 
